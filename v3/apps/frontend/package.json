@@ -1,0 +1,28 @@
+{
+  "name": "agi-voice-v3-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev --host 127.0.0.1 --port 4173 --strictPort",
+    "build": "svelte-kit sync && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173 --strictPort",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test:control": "node --test tests/control-regressions.mjs"
+  },
+  "dependencies": {
+    "@iconify/svelte": "^5.2.1",
+    "marked": "^16.4.0",
+    "svelte": "^5.0.0"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.8",
+    "@sveltejs/kit": "2.15.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@tailwindcss/vite": "^4.1.14",
+    "svelte-check": "^4.0.0",
+    "tailwindcss": "^4.1.14",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3"
+  }
+}

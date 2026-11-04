@@ -1,0 +1,556 @@
+import { app, BrowserWindow, Menu, Tray, dialog, globalShortcut, ipcMain, screen } from 'electron';
+import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const FRONTEND_URL = process.env.V3_FRONTEND_URL || 'http://127.0.0.1:4173';
+const BACKEND_URL = process.env.V3_BACKEND_URL || 'http://127.0.0.1:8000';
+const BACKEND_HEALTH_URL = `${BACKEND_URL}/health`;
+const BACKEND_SHUTDOWN_SYNC_URL = `${BACKEND_URL}/api/settings/db/sync-shutdown`;
+const FRONTEND_CHECK_TIMEOUT_MS = 1200;
+const FRONTEND_RETRY_INTERVAL_MS = 1500;
+const FRONTEND_MAX_WAIT_MS = 30000;
+
+let mainWindow = null;
+let isRendererClosing = false;
+let isAppQuitting = false;
+let hasShutdownSynced = false;
+let tray = null;
+let frontendRetryTimer = null;
+let frontendRetryInFlight = false;
+let isShowingFallback = false;
+
+function toSizePayload(size) {
+  if (!Array.isArray(size) || size.length < 2) {
+    return null;
+  }
+
+  return {
+    width: size[0],
+    height: size[1],
+  };
+}
+
+function toPositionPayload(position) {
+  if (!Array.isArray(position) || position.length < 2) {
+    return null;
+  }
+
+  return {
+    x: position[0],
+    y: position[1],
+  };
+}
+
+function sendWindowEvent(eventName, payload = {}) {
+  if (!mainWindow) {
+    return;
+  }
+
+  mainWindow.webContents.send('desktop:window-event', {
+    eventName,
+    ...payload,
+  });
+}
+
+function createWindow() {
+  isShowingFallback = false;
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    title: 'AGI Voice V3',
+    show: false,
+    frame: false,
+    titleBarStyle: 'hidden',
+    autoHideMenuBar: true,
+    backgroundColor: '#111111',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  });
+
+  mainWindow.on('focus', () => sendWindowEvent('focus'));
+  mainWindow.on('blur', () => sendWindowEvent('blur'));
+  mainWindow.on('maximize', () => sendWindowEvent('maximize'));
+  mainWindow.on('unmaximize', () => sendWindowEvent('unmaximize'));
+  mainWindow.on('enter-full-screen', () => sendWindowEvent('enter-full-screen'));
+  mainWindow.on('leave-full-screen', () => sendWindowEvent('leave-full-screen'));
+  mainWindow.on('resize', () => sendWindowEvent('resize', { size: toSizePayload(mainWindow?.getSize()) }));
+  mainWindow.on('move', () => sendWindowEvent('move', { position: toPositionPayload(mainWindow?.getPosition()) }));
+  mainWindow.on('close', (event) => {
+    if (!isRendererClosing && !isAppQuitting && !isShowingFallback) {
+      event.preventDefault();
+      sendWindowEvent('close-requested', {
+        window: getWindowSnapshot(),
+      });
+    }
+  });
+
+  mainWindow.on('closed', () => {
+    stopFrontendRetry();
+    mainWindow = null;
+  });
+
+  mainWindow.setMenuBarVisibility(false);
+}
+
+function restoreFromTray() {
+  if (!mainWindow) {
+    return;
+  }
+
+  mainWindow.show();
+  mainWindow.focus();
+  sendWindowEvent('tray-restore');
+}
+
+function openWidgetFromTray() {
+  if (!mainWindow) {
+    return;
+  }
+
+  mainWindow.show();
+  mainWindow.focus();
+  sendWindowEvent('tray-widget');
+}
+
+function createTray() {
+  if (tray) {
+    return;
+  }
+
+  const iconFile = process.platform === 'win32' ? 'icon.ico' : '32x32.png';
+  const iconPath = path.resolve(__dirname, '../assets', iconFile);
+  if (!fsSync.existsSync(iconPath)) {
+    console.warn(`Tray icon not found: ${iconPath}`);
+    return;
+  }
+
+  tray = new Tray(iconPath);
+  tray.setToolTip('AGI Voice V3');
+
+  const menu = Menu.buildFromTemplate([
+    {
+      id: 'open',
+      label: '열기',
+      click: () => restoreFromTray(),
+    },
+    {
+      id: 'widget',
+      label: '위젯',
+      click: () => openWidgetFromTray(),
+    },
+    {
+      id: 'quit',
+      label: '종료',
+      click: async () => {
+        await syncBackendOnQuit();
+        isAppQuitting = true;
+        app.quit();
+      },
+    },
+  ]);
+
+  tray.setContextMenu(menu);
+  tray.on('click', () => {
+    restoreFromTray();
+  });
+}
+
+function getWindowSnapshot() {
+  if (!mainWindow) {
+    return null;
+  }
+
+  const bounds = mainWindow.getBounds();
+  const position = mainWindow.getPosition();
+  const size = mainWindow.getSize();
+  const display = screen.getDisplayMatching(bounds);
+
+  return {
+    bounds,
+    position: toPositionPayload(position),
+    size: toSizePayload(size),
+    isMaximized: mainWindow.isMaximized(),
+    isFullscreen: mainWindow.isFullScreen(),
+    display: display
+      ? {
+          bounds: display.bounds,
+          workArea: display.workArea,
+          scaleFactor: display.scaleFactor,
+          rotation: display.rotation,
+          id: display.id,
+          label: display.label,
+        }
+      : null,
+  };
+}
+
+async function canReachFrontend() {
+  let timeout = null;
+  try {
+    const controller = new AbortController();
+    timeout = setTimeout(() => controller.abort(), FRONTEND_CHECK_TIMEOUT_MS);
+    const response = await fetch(FRONTEND_URL, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+function stopFrontendRetry() {
+  if (frontendRetryTimer) {
+    clearInterval(frontendRetryTimer);
+    frontendRetryTimer = null;
+  }
+}
+
+function startFrontendRetry() {
+  if (frontendRetryTimer) {
+    return;
+  }
+
+  frontendRetryTimer = setInterval(async () => {
+    if (frontendRetryInFlight) {
+      return;
+    }
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      stopFrontendRetry();
+      return;
+    }
+
+    const window = mainWindow;
+    frontendRetryInFlight = true;
+    try {
+      const frontendReady = await canReachFrontend();
+      if (!frontendReady || mainWindow !== window || window.isDestroyed()) {
+        return;
+      }
+      await window.loadURL(FRONTEND_URL);
+      if (mainWindow === window && !window.isDestroyed()) {
+        isShowingFallback = false;
+        window.show();
+        stopFrontendRetry();
+      }
+    } catch (error) {
+      console.warn(`Failed to load frontend URL: ${FRONTEND_URL}`, error);
+    } finally {
+      frontendRetryInFlight = false;
+    }
+  }, FRONTEND_RETRY_INTERVAL_MS);
+}
+
+async function loadInitialContent() {
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) {
+    return;
+  }
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < FRONTEND_MAX_WAIT_MS) {
+    const frontendReady = await canReachFrontend();
+    if (mainWindow !== window || window.isDestroyed()) {
+      return;
+    }
+    if (frontendReady) {
+      try {
+        await window.loadURL(FRONTEND_URL);
+        if (mainWindow === window && !window.isDestroyed()) {
+          isShowingFallback = false;
+          window.show();
+        }
+        return;
+      } catch (error) {
+        console.warn(`Initial frontend navigation failed: ${FRONTEND_URL}`, error);
+        break;
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, FRONTEND_RETRY_INTERVAL_MS));
+  }
+
+  if (mainWindow !== window || window.isDestroyed()) {
+    return;
+  }
+  await window.loadFile(path.join(__dirname, 'fallback.html'), {
+    query: { frontendUrl: FRONTEND_URL, backendUrl: BACKEND_URL },
+  });
+  if (mainWindow === window && !window.isDestroyed()) {
+    isShowingFallback = true;
+    window.show();
+    startFrontendRetry();
+  }
+}
+
+async function pingBackend() {
+  try {
+    const response = await fetch(BACKEND_HEALTH_URL);
+    const data = await response.json().catch(() => ({}));
+
+    return {
+      ok: response.ok,
+      status: response.status,
+      url: BACKEND_HEALTH_URL,
+      data,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      url: BACKEND_HEALTH_URL,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function syncBackendOnQuit() {
+  if (hasShutdownSynced) {
+    return;
+  }
+
+  try {
+    const response = await fetch(BACKEND_SHUTDOWN_SYNC_URL, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`sync failed with status ${response.status}`);
+    }
+    hasShutdownSynced = true;
+  } catch (error) {
+    console.warn(`Backend shutdown sync failed: ${BACKEND_SHUTDOWN_SYNC_URL}`, error);
+  }
+}
+
+function registerDefaultShortcuts() {
+  globalShortcut.register('CommandOrControl+Shift+I', () => {
+    mainWindow?.webContents.toggleDevTools();
+  });
+}
+
+app.whenReady().then(async () => {
+  Menu.setApplicationMenu(null);
+  createWindow();
+  createTray();
+  await loadInitialContent();
+  registerDefaultShortcuts();
+
+  const status = await pingBackend();
+  if (!status.ok) {
+    console.warn(`Backend health check failed: ${status.url}`);
+  }
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+      void loadInitialContent().catch((error) => {
+        console.error('Failed to load frontend and fallback', error);
+        isAppQuitting = true;
+        app.quit();
+      });
+    }
+  });
+}).catch((error) => {
+  console.error('Failed to initialize desktop content', error);
+  isAppQuitting = true;
+  app.quit();
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
+});
+
+app.on('will-quit', () => {
+  isAppQuitting = true;
+  globalShortcut.unregisterAll();
+});
+
+ipcMain.handle('window:snapshot', () => {
+  return getWindowSnapshot();
+});
+
+ipcMain.handle('window:show', () => {
+  mainWindow?.show();
+  return true;
+});
+
+ipcMain.handle('window:hide', () => {
+  mainWindow?.hide();
+  return true;
+});
+
+ipcMain.handle('window:focus', () => {
+  mainWindow?.focus();
+  return true;
+});
+
+ipcMain.handle('window:minimize', () => {
+  mainWindow?.minimize();
+  return true;
+});
+
+ipcMain.handle('window:maximize', () => {
+  mainWindow?.maximize();
+  return true;
+});
+
+ipcMain.handle('window:toggleMaximize', () => {
+  if (!mainWindow) {
+    return false;
+  }
+
+  if (mainWindow.isMaximized()) {
+    mainWindow.unmaximize();
+  } else {
+    mainWindow.maximize();
+  }
+
+  return true;
+});
+
+ipcMain.handle('window:unmaximize', () => {
+  mainWindow?.unmaximize();
+  return true;
+});
+
+ipcMain.handle('window:setSize', (_, width, height) => {
+  if (!mainWindow) {
+    return false;
+  }
+
+  mainWindow.setSize(width, height);
+  return true;
+});
+
+ipcMain.handle('window:setPosition', (_, x, y) => {
+  if (!mainWindow) {
+    return false;
+  }
+
+  mainWindow.setPosition(x, y);
+  return true;
+});
+
+ipcMain.handle('window:outerSize', () => {
+  if (!mainWindow) {
+    return null;
+  }
+
+  return toSizePayload(mainWindow.getSize());
+});
+
+ipcMain.handle('window:outerPosition', () => {
+  if (!mainWindow) {
+    return null;
+  }
+
+  return toPositionPayload(mainWindow.getPosition());
+});
+
+ipcMain.handle('window:isMaximized', () => {
+  return mainWindow?.isMaximized() ?? false;
+});
+
+ipcMain.handle('window:isFullscreen', () => {
+  return mainWindow?.isFullScreen() ?? false;
+});
+
+ipcMain.handle('window:setFullscreen', (_, value) => {
+  if (!mainWindow) {
+    return false;
+  }
+
+  mainWindow.setFullScreen(Boolean(value));
+  return true;
+});
+
+ipcMain.handle('window:currentDisplay', () => {
+  if (!mainWindow) {
+    return null;
+  }
+
+  const display = screen.getDisplayMatching(mainWindow.getBounds());
+  return display
+    ? {
+        id: display.id,
+        label: display.label,
+        bounds: display.bounds,
+        workArea: display.workArea,
+        size: display.size,
+        workAreaSize: display.workAreaSize,
+        scaleFactor: display.scaleFactor,
+        rotation: display.rotation,
+      }
+    : null;
+});
+
+ipcMain.handle('window:requestClose', async () => {
+  if (!mainWindow) {
+    return false;
+  }
+
+  isRendererClosing = true;
+  mainWindow.close();
+  isRendererClosing = false;
+  return true;
+});
+
+ipcMain.handle('dialog:openFile', async (_, options = {}) => {
+  const result = await dialog.showOpenDialog(mainWindow ?? undefined, options);
+  return result;
+});
+
+ipcMain.handle('dialog:saveFile', async (_, options = {}) => {
+  const result = await dialog.showSaveDialog(mainWindow ?? undefined, options);
+  return result;
+});
+
+ipcMain.handle('fs:readTextFile', async (_, filePath) => {
+  return fs.readFile(filePath, 'utf8');
+});
+
+ipcMain.handle('fs:writeTextFile', async (_, filePath, contents) => {
+  await fs.writeFile(filePath, contents, 'utf8');
+  return true;
+});
+
+ipcMain.handle('shortcuts:register', async (_, accelerator) => {
+  if (typeof accelerator !== 'string' || accelerator.trim() === '') {
+    throw new Error('accelerator is required');
+  }
+
+  return globalShortcut.register(accelerator, () => {
+    mainWindow?.show();
+    mainWindow?.focus();
+  });
+});
+
+ipcMain.handle('shortcuts:unregister', async (_, accelerator) => {
+  if (typeof accelerator !== 'string' || accelerator.trim() === '') {
+    return false;
+  }
+
+  return globalShortcut.unregister(accelerator);
+});
+
+ipcMain.handle('backend:ping', async () => {
+  return pingBackend();
+});

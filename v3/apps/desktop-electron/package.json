@@ -1,0 +1,17 @@
+{
+  "name": "agi-voice-v3-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electronmon .",
+    "lint": "node --check src/main.js && node --check src/preload.cjs",
+    "test": "node --test tests/startup.test.mjs"
+  },
+  "dependencies": {
+    "electron": "^31.0.0",
+    "electronmon": "^2.0.2"
+  }
+}
