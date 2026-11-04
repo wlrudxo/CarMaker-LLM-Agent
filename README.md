@@ -81,8 +81,8 @@ Kyoungtae Ji, Dongyeol Won, Chanhyeok Ko, and Kyoungseok Han. “LLM 에이전�
 
 ## Acknowledgment
 
-이 논문은 2025년도 정부(과학기술정보통신부)의 재원으로 정보통신기획평가원의 지원을 받아 수행된 연구임 (No.RS-2025-25422680, Meta cognitive AGI Framework and its Applications)
+This work was supported by the Institute of Information & Communications Technology Planning & Evaluation (IITP) grant funded by the Korea government (MSIT) (No. RS-2025-25422680, Meta cognitive AGI Framework and its Applications).
 
 ## License and provenance
 
-MIT License, copyright 2026 VOICE Lab, Hanyang University. Third-party dependencies retain their own licenses. This repository starts a new history from selected application sources in the private AGI_VOICE repository, source commit `f1c7171fa1f7bee17ac2448e2ce792bbfc21ad7e`.
+MIT License, copyright 2026 VOICE Lab, Hanyang University. Third-party dependencies retain their own licenses.
