@@ -53,8 +53,6 @@ CarMaker는 차량 동역학, ADAS와 자율주행 검증, 고정밀 시뮬레�
 
 ![제어 방식별 차량 궤적 비교](docs/images/trajectory_comparison.png)
 
-Feedback Loop는 LLM을 반복 호출하므로 시뮬레이션 일시정지 시간이 길어집니다. 반복 횟수의 종료 조건은 아직 정의되어 있지 않습니다. 단일 시나리오 결과이므로 일반화에는 추가 검증이 필요합니다.
-
 ## trigger 조건 예시
 
 화면에서 조건식을 직접 만들고 여러 trigger를 등록합니다.
@@ -144,7 +142,7 @@ npm run build
 
 ## 사사
 
-이 논문은 2025년도 정부(과학기술정보통신부)의 재원으로 정보통신기획평가원의 지원을 받아 수행된 연구임 (No.RS-2025-25422680, Meta cognitive AGI Framework and its Applications)
+이 연구는 2025년도 정부(과학기술정보통신부)의 재원으로 정보통신기획평가원의 지원을 받아 수행된 연구임 (No.RS-2025-25422680, Meta cognitive AGI Framework and its Applications)
 
 > This work was supported by the Institute of Information & Communications Technology Planning & Evaluation (IITP) grant funded by the Korea government (MSIT) (No. RS-2025-25422680, Meta cognitive AGI Framework and its Applications).
 
